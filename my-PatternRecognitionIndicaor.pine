@@ -1,0 +1,487 @@
+//@version=6
+indicator("Jevaughn's Chart Patterns", shorttitle="JP Chart Patterns", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ═══════════════════════════════════════════════════════════════
+//  All Chart Patterns [Futures]  v3
+//  ZigZag swings -> pattern detection -> shaded pattern area,
+//  price target (green = awaiting, red = reached), breakout alerts,
+//  "only show last N patterns" option.
+// ═══════════════════════════════════════════════════════════════
+
+// ─────────────── INPUTS ───────────────
+string gZ = "ZigZag"
+int   pivLen   = input.int(6, "Pivot length (bars each side)", minval=2, maxval=40, group=gZ, tooltip="Bars needed on each side to confirm a swing high/low. Lower = more patterns + more noise. Higher = fewer, bigger patterns.")
+float minSwing = input.float(1.0, "Min swing size (x ATR)", minval=0.0, step=0.25, group=gZ, tooltip="Ignores swings smaller than this many ATRs.")
+int   maxSpan  = input.int(300, "Max pattern width (bars)", minval=30, group=gZ)
+
+string gP = "Patterns"
+bool showHS    = input.bool(true, "Head & Shoulders (+ Inverse)", group=gP)
+bool showDT    = input.bool(true, "Double / Triple Tops & Bottoms", group=gP)
+bool showTri   = input.bool(true, "Triangles", group=gP)
+bool showWedge = input.bool(true, "Wedges", group=gP)
+bool showFlag  = input.bool(true, "Flags & Pennants", group=gP)
+bool showChan  = input.bool(true, "Channels", group=gP)
+bool showBroad = input.bool(true, "Broadening", group=gP)
+
+string gT = "Tuning"
+float convR    = input.float(0.75, "Convergence ratio (end width / start width)", minval=0.3, maxval=0.95, step=0.05, group=gT, tooltip="Below this = converging (triangles, wedges, pennants). Above 1 / this = diverging (broadening). In between = parallel (channels, flags).")
+float flatPct  = input.float(0.15, "Flat-line threshold", minval=0.02, maxval=0.5, step=0.01, group=gT, tooltip="A trendline counts as flat if it moves less than this fraction of the pattern height.")
+float fitPct   = input.float(0.25, "Line fit tolerance", minval=0.05, maxval=0.6, step=0.05, group=gT, tooltip="How far the middle touch may sit from the trendline (fraction of pattern height).")
+float eqPct    = input.float(0.20, "Equal tops/bottoms tolerance", minval=0.05, maxval=0.5, step=0.05, group=gT)
+float symPct   = input.float(0.35, "Shoulder symmetry tolerance", minval=0.1, maxval=0.8, step=0.05, group=gT)
+float poleMult = input.float(2.0, "Min pole / flag height ratio", minval=1.0, step=0.25, group=gT)
+
+string gD = "Display & Alerts"
+string visMode   = input.string("All", "Patterns", options=["All", "Only Awaiting", "Last Awaiting"], group=gD, tooltip="All = keep everything. Only Awaiting = remove a pattern once its target is reached. Last Awaiting = only show the newest pattern that hasn't reached its target.")
+bool  onlyRecent = input.bool(true, "Show only most recent patterns", group=gD, tooltip="Keeps only the newest N patterns on the chart and deletes older ones.")
+int   recentN    = input.int(3, "How many recent patterns", minval=1, maxval=20, group=gD)
+bool  showZZ     = input.bool(true, "Show zigzag", group=gD)
+bool  showTgt    = input.bool(true, "Show price targets", group=gD)
+bool  tgtPrice   = input.bool(true, "Show price on target label", group=gD)
+int   capBars    = input.int(5, "Target line length (bars)", minval=1, maxval=50, group=gD)
+int   bgTransp   = input.int(85, "Background transparency", minval=50, maxval=98, group=gD)
+int   watchBars  = input.int(50, "Watch for breakout (bars)", minval=5, group=gD, tooltip="How long after a pattern forms the script waits for a breakout alert.")
+bool  needVol    = input.bool(false, "Require above-avg volume on breakout", group=gD)
+color cBull      = input.color(#26a69a, "Bullish pattern", group=gD)
+color cBear      = input.color(#ef5350, "Bearish pattern", group=gD)
+color cNeu       = input.color(#2962ff, "Neutral pattern", group=gD)
+color cAwait     = input.color(#4caf50, "Target: awaiting", group=gD)
+color cReach     = input.color(#f23645, "Target: reached", group=gD)
+
+// ─────────────── TYPES ───────────────
+type Pat
+    string name = ""
+    int    bias = 0
+    float  h    = 0.0
+    int    sx   = 0
+    int    ex   = 0
+    int    ux1  = na
+    float  uy1  = na
+    int    ux2  = na
+    float  uy2  = na
+    int    lx1  = na
+    float  ly1  = na
+    int    lx2  = na
+    float  ly2  = na
+    float  boxT = na
+    float  boxB = na
+
+type Tgt
+    float price
+    int   dir
+    line  vl
+    line  cl
+    label lb
+
+type Drawn
+    array<line>     lns
+    array<label>    lbs
+    array<linefill> fls
+    array<box>      bxs
+    array<Tgt>      tgs
+    bool            alive = true
+
+// ─────────────── HELPERS ───────────────
+int   nI = na
+float nF = na
+float divR = 1.0 / convR
+
+lineAt(int x1, float y1, int x2, float y2, int x) =>
+    y1 + (y2 - y1) / (x2 - x1) * (x - x1)
+
+fillPat(Pat p, string nm, int bs, float hh, int sx, int ex, int ux1, float uy1, int ux2, float uy2, int lx1, float ly1, int lx2, float ly2) =>
+    p.name := nm
+    p.bias := bs
+    p.h    := hh
+    p.sx   := sx
+    p.ex   := ex
+    p.ux1  := ux1
+    p.uy1  := uy1
+    p.ux2  := ux2
+    p.uy2  := uy2
+    p.lx1  := lx1
+    p.ly1  := ly1
+    p.lx2  := lx2
+    p.ly2  := ly2
+    p
+
+mkTarget(int ex, float base, float tgt, int dir, color c, int cap, bool withPrice) =>
+    line vl = line.new(ex, base, ex, tgt, xloc=xloc.bar_index, color=c, style=line.style_dotted, width=1)
+    line cl = line.new(ex, tgt, ex + cap, tgt, xloc=xloc.bar_index, color=c, style=line.style_dotted, width=1)
+    string txt = withPrice ? "Target " + str.tostring(tgt, format.mintick) : "Target"
+    label lb = label.new(ex, tgt, txt, xloc=xloc.bar_index, yloc=yloc.price, color=c, style=dir == 1 ? label.style_label_down : label.style_label_up, textcolor=color.white, size=size.small)
+    Tgt.new(tgt, dir, vl, cl, lb)
+
+clearDrawn(Drawn d) =>
+    for l in d.lns
+        line.delete(l)
+    for lb in d.lbs
+        label.delete(lb)
+    for f in d.fls
+        linefill.delete(f)
+    for b in d.bxs
+        box.delete(b)
+    for t in d.tgs
+        line.delete(t.vl)
+        line.delete(t.cl)
+        label.delete(t.lb)
+    array.clear(d.lns)
+    array.clear(d.lbs)
+    array.clear(d.fls)
+    array.clear(d.bxs)
+    array.clear(d.tgs)
+    d.alive := false
+    d
+
+// Adds a pivot to the zigzag. Same direction as last pivot -> keep the more extreme one.
+addPivot(array<int> xs, array<float> ys, array<int> ds, int x, float y, int d, float minMove) =>
+    bool added = false
+    int n = array.size(ys)
+    if n == 0
+        array.push(xs, x)
+        array.push(ys, y)
+        array.push(ds, d)
+        added := true
+    else
+        int lastD = array.get(ds, n - 1)
+        float lastY = array.get(ys, n - 1)
+        if lastD == d
+            if (d == 1 and y > lastY) or (d == -1 and y < lastY)
+                array.set(xs, n - 1, x)
+                array.set(ys, n - 1, y)
+        else if math.abs(y - lastY) >= minMove
+            array.push(xs, x)
+            array.push(ys, y)
+            array.push(ds, d)
+            added := true
+    if array.size(ys) > 40
+        array.shift(xs)
+        array.shift(ys)
+        array.shift(ds)
+    added
+
+// ─────────────── STATE ───────────────
+var array<int>   pX = array.new<int>()
+var array<float> pY = array.new<float>()
+var array<int>   pD = array.new<int>()
+var array<Drawn> tracked = array.new<Drawn>()
+var array<Drawn> recent  = array.new<Drawn>()
+var string lastName = ""
+var int    lastEnd  = 0
+var bool   watchOn    = false
+var int    watchStart = 0
+var Pat    wp = Pat.new()
+
+// ─────────────── SWINGS ───────────────
+atr   = ta.atr(14)
+volMA = ta.sma(volume, 20)
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+bool newPiv = false
+if not na(ph)
+    newPiv := addPivot(pX, pY, pD, bar_index - pivLen, ph, 1, minSwing * atr) or newPiv
+if not na(pl)
+    newPiv := addPivot(pX, pY, pD, bar_index - pivLen, pl, -1, minSwing * atr) or newPiv
+
+bool newBull = false
+bool newBear = false
+bool tgtHit  = false
+
+// ─────────────── PATTERN DETECTION ───────────────
+// Uses the last 5 pivots (x0..x4, x4 = newest).
+if newPiv and array.size(pY) >= 5
+    int n = array.size(pY)
+    int x0 = array.get(pX, n - 5)
+    int x1 = array.get(pX, n - 4)
+    int x2 = array.get(pX, n - 3)
+    int x3 = array.get(pX, n - 2)
+    int x4 = array.get(pX, n - 1)
+    float y0 = array.get(pY, n - 5)
+    float y1 = array.get(pY, n - 4)
+    float y2 = array.get(pY, n - 3)
+    float y3 = array.get(pY, n - 2)
+    float y4 = array.get(pY, n - 1)
+    bool top = array.get(pD, n - 1) == 1
+    Pat pat = Pat.new()
+
+    if (x4 - x0) <= maxSpan
+
+        // ── 1) Head & Shoulders / Inverse ──
+        if showHS
+            float k = (y3 - y1) / (x3 - x1)
+            float nk0 = y1 + k * (x0 - x1)
+            float nk2 = y1 + k * (x2 - x1)
+            float nk4 = y1 + k * (x4 - x1)
+            if top
+                float hh = y2 - nk2
+                if hh > 0 and y0 > nk0 and y4 > nk4 and (y2 - math.max(y0, y4)) >= 0.2 * hh and math.abs(y0 - y4) <= symPct * hh
+                    fillPat(pat, "Head & Shoulders", -1, hh, x0, x4, nI, nF, nI, nF, x1, y1, x3, y3)
+                    pat.boxT := y2
+                    pat.boxB := math.min(y1, y3)
+            else
+                float hh = nk2 - y2
+                if hh > 0 and y0 < nk0 and y4 < nk4 and (math.min(y0, y4) - y2) >= 0.2 * hh and math.abs(y0 - y4) <= symPct * hh
+                    fillPat(pat, "Inverse Head & Shoulders", 1, hh, x0, x4, x1, y1, x3, y3, nI, nF, nI, nF)
+                    pat.boxT := math.max(y1, y3)
+                    pat.boxB := y2
+
+        // ── 2) Double / Triple Tops & Bottoms ──
+        if showDT and pat.name == ""
+            if top
+                float ht = (y0 + y2 + y4) / 3 - (y1 + y3) / 2
+                float hd = (y2 + y4) / 2 - y3
+                if ht > 0 and (math.max(y0, y2, y4) - math.min(y0, y2, y4)) <= eqPct * ht
+                    float sup = math.min(y1, y3)
+                    fillPat(pat, "Triple Top", -1, ht, x0, x4, nI, nF, nI, nF, x1, sup, x4, sup)
+                    pat.boxT := math.max(y0, y2, y4)
+                    pat.boxB := sup
+                else if hd > 0 and math.abs(y2 - y4) <= eqPct * hd and math.max(y2, y4) >= y0
+                    fillPat(pat, "Double Top", -1, hd, x2, x4, nI, nF, nI, nF, x2, y3, x4, y3)
+                    pat.boxT := math.max(y2, y4)
+                    pat.boxB := y3
+            else
+                float ht = (y1 + y3) / 2 - (y0 + y2 + y4) / 3
+                float hd = y3 - (y2 + y4) / 2
+                if ht > 0 and (math.max(y0, y2, y4) - math.min(y0, y2, y4)) <= eqPct * ht
+                    float resis = math.max(y1, y3)
+                    fillPat(pat, "Triple Bottom", 1, ht, x0, x4, x1, resis, x4, resis, nI, nF, nI, nF)
+                    pat.boxT := resis
+                    pat.boxB := math.min(y0, y2, y4)
+                else if hd > 0 and math.abs(y2 - y4) <= eqPct * hd and math.min(y2, y4) <= y0
+                    fillPat(pat, "Double Bottom", 1, hd, x2, x4, x2, y3, x4, y3, nI, nF, nI, nF)
+                    pat.boxT := y3
+                    pat.boxB := math.min(y2, y4)
+
+        // ── 3) Flags & Pennants (pole = x0 -> x1, consolidation = x1..x4) ──
+        if showFlag and pat.name == ""
+            int   fux1 = top ? x2 : x1
+            float fuy1 = top ? y2 : y1
+            int   fux2 = top ? x4 : x3
+            float fuy2 = top ? y4 : y3
+            int   flx1 = top ? x1 : x2
+            float fly1 = top ? y1 : y2
+            int   flx2 = top ? x3 : x4
+            float fly2 = top ? y3 : y4
+            float hS = lineAt(fux1, fuy1, fux2, fuy2, x1) - lineAt(flx1, fly1, flx2, fly2, x1)
+            float hE = lineAt(fux1, fuy1, fux2, fuy2, x4) - lineAt(flx1, fly1, flx2, fly2, x4)
+            if hS > 0 and hE > 0
+                float pole = math.abs(y1 - y0)
+                float hM = math.max(hS, hE)
+                float uMv = lineAt(fux1, fuy1, fux2, fuy2, x4) - lineAt(fux1, fuy1, fux2, fuy2, x1)
+                float lMv = lineAt(flx1, fly1, flx2, fly2, x4) - lineAt(flx1, fly1, flx2, fly2, x1)
+                float ft = flatPct * hM
+                float r = hE / hS
+                bool poleOk = pole >= poleMult * hM and (x1 - x0) <= (x4 - x1)
+                if poleOk
+                    bool para = r >= convR and r <= divR
+                    bool conv = r < convR and uMv <= ft and lMv >= -ft
+                    if top
+                        if para and uMv >= -ft and lMv >= -ft
+                            fillPat(pat, "Bear Flag", -1, pole, x0, x4, fux1, fuy1, fux2, fuy2, flx1, fly1, flx2, fly2)
+                        else if conv
+                            fillPat(pat, "Bear Pennant", -1, pole, x0, x4, fux1, fuy1, fux2, fuy2, flx1, fly1, flx2, fly2)
+                    else
+                        if para and uMv <= ft and lMv <= ft
+                            fillPat(pat, "Bull Flag", 1, pole, x0, x4, fux1, fuy1, fux2, fuy2, flx1, fly1, flx2, fly2)
+                        else if conv
+                            fillPat(pat, "Bull Pennant", 1, pole, x0, x4, fux1, fuy1, fux2, fuy2, flx1, fly1, flx2, fly2)
+
+        // ── 4) Triangles / Wedges / Channels / Broadening ──
+        if pat.name == "" and (showTri or showWedge or showChan or showBroad)
+            int   gux1 = top ? x0 : x1
+            float guy1 = top ? y0 : y1
+            int   gux2 = top ? x4 : x3
+            float guy2 = top ? y4 : y3
+            int   glx1 = top ? x1 : x0
+            float gly1 = top ? y1 : y0
+            int   glx2 = top ? x3 : x4
+            float gly2 = top ? y3 : y4
+            float hS = lineAt(gux1, guy1, gux2, guy2, x0) - lineAt(glx1, gly1, glx2, gly2, x0)
+            float hE = lineAt(gux1, guy1, gux2, guy2, x4) - lineAt(glx1, gly1, glx2, gly2, x4)
+            if hS > 0 and hE > 0
+                float hM = math.max(hS, hE)
+                float uMv = lineAt(gux1, guy1, gux2, guy2, x4) - lineAt(gux1, guy1, gux2, guy2, x0)
+                float lMv = lineAt(glx1, gly1, glx2, gly2, x4) - lineAt(glx1, gly1, glx2, gly2, x0)
+                float ft = flatPct * hM
+                int uDir = uMv > ft ? 1 : uMv < -ft ? -1 : 0
+                int lDir = lMv > ft ? 1 : lMv < -ft ? -1 : 0
+                float r = hE / hS
+                float mid = top ? lineAt(gux1, guy1, gux2, guy2, x2) : lineAt(glx1, gly1, glx2, gly2, x2)
+                if math.abs(y2 - mid) <= fitPct * hM
+                    string nm = ""
+                    int bs = 0
+                    if r < convR
+                        if showTri and uDir == 0 and lDir == 1
+                            nm := "Ascending Triangle"
+                            bs := 1
+                        else if showTri and uDir == -1 and lDir == 0
+                            nm := "Descending Triangle"
+                            bs := -1
+                        else if showTri and uDir == -1 and lDir == 1
+                            nm := "Symmetrical Triangle"
+                        else if showWedge and uDir == 1 and lDir == 1
+                            nm := "Rising Wedge"
+                            bs := -1
+                        else if showWedge and uDir == -1 and lDir == -1
+                            nm := "Falling Wedge"
+                            bs := 1
+                    else if r > divR
+                        if showBroad and uDir == 1 and lDir == -1
+                            nm := "Broadening Formation"
+                        else if showBroad and uDir == 1 and lDir == 0
+                            nm := "Ascending Broadening"
+                        else if showBroad and uDir == 0 and lDir == -1
+                            nm := "Descending Broadening"
+                    else
+                        if showChan and uDir == 1 and lDir == 1
+                            nm := "Ascending Channel"
+                            bs := 1
+                        else if showChan and uDir == -1 and lDir == -1
+                            nm := "Descending Channel"
+                            bs := -1
+                        else if showChan and uDir == 0 and lDir == 0
+                            nm := "Ranging Channel"
+                    if nm != ""
+                        fillPat(pat, nm, bs, hM, x0, x4, gux1, guy1, gux2, guy2, glx1, gly1, glx2, gly2)
+
+    // ── Draw pattern, background, target; arm breakout watch ──
+    if pat.name != ""
+        bool dup = pat.name == lastName and pat.sx < lastEnd
+        if not dup
+            color pc = pat.bias == 1 ? cBull : pat.bias == -1 ? cBear : cNeu
+            bool hasU = not na(pat.uy1)
+            bool hasL = not na(pat.ly1)
+            bool both = hasU and hasL
+
+            if visMode == "Last Awaiting"
+                for d in tracked
+                    clearDrawn(d)
+                array.clear(tracked)
+
+            Drawn dw = Drawn.new(array.new<line>(), array.new<label>(), array.new<linefill>(), array.new<box>(), array.new<Tgt>())
+
+            // common start x so the shaded area is a clean polygon
+            int lsx = pat.sx
+            if both
+                lsx := math.min(pat.ux1, pat.lx1)
+            int uS = both ? lsx : nz(pat.ux1)
+            int lS = both ? lsx : nz(pat.lx1)
+
+            // trendlines + background
+            line lnU = na
+            line lnL = na
+            if hasU
+                lnU := line.new(uS, lineAt(pat.ux1, pat.uy1, pat.ux2, pat.uy2, uS), pat.ex, lineAt(pat.ux1, pat.uy1, pat.ux2, pat.uy2, pat.ex), xloc=xloc.bar_index, color=pc, width=2)
+                array.push(dw.lns, lnU)
+            if hasL
+                lnL := line.new(lS, lineAt(pat.lx1, pat.ly1, pat.lx2, pat.ly2, lS), pat.ex, lineAt(pat.lx1, pat.ly1, pat.lx2, pat.ly2, pat.ex), xloc=xloc.bar_index, color=pc, width=2)
+                array.push(dw.lns, lnL)
+            if both
+                array.push(dw.fls, linefill.new(lnU, lnL, color.new(pc, bgTransp)))
+            else if not na(pat.boxT)
+                array.push(dw.bxs, box.new(pat.sx, pat.boxT, pat.ex, pat.boxB, xloc=xloc.bar_index, border_color=color.new(pc, 70), bgcolor=color.new(pc, bgTransp)))
+
+            // zigzag inside the pattern
+            if showZZ
+                for i = n - 5 to n - 2
+                    if array.get(pX, i) >= pat.sx
+                        array.push(dw.lns, line.new(array.get(pX, i), array.get(pY, i), array.get(pX, i + 1), array.get(pY, i + 1), xloc=xloc.bar_index, color=pc, width=1))
+
+            // name label: bullish below the pattern, bearish/neutral above
+            bool above = pat.bias != 1
+            int labX = math.round(((both ? lsx : pat.sx) + pat.ex) / 2.0)
+            float labY = 0.0
+            if both
+                labY := above ? lineAt(pat.ux1, pat.uy1, pat.ux2, pat.uy2, labX) : lineAt(pat.lx1, pat.ly1, pat.lx2, pat.ly2, labX)
+            else
+                labY := above ? pat.boxT : pat.boxB
+            array.push(dw.lbs, label.new(labX, labY, pat.name, xloc=xloc.bar_index, yloc=yloc.price, color=pc, style=above ? label.style_label_down : label.style_label_up, textcolor=color.white, size=size.small))
+
+            // price targets (measured move from the breakout line)
+            if showTgt
+                if pat.bias >= 0 and hasU
+                    float bUp = lineAt(pat.ux1, pat.uy1, pat.ux2, pat.uy2, pat.ex)
+                    array.push(dw.tgs, mkTarget(pat.ex, bUp, bUp + pat.h, 1, cAwait, capBars, tgtPrice))
+                if pat.bias <= 0 and hasL
+                    float bDn = lineAt(pat.lx1, pat.ly1, pat.lx2, pat.ly2, pat.ex)
+                    array.push(dw.tgs, mkTarget(pat.ex, bDn, bDn - pat.h, -1, cAwait, capBars, tgtPrice))
+
+            array.push(tracked, dw)
+            if array.size(tracked) > 100
+                array.shift(tracked)
+
+            // keep only the newest N patterns on the chart
+            array.push(recent, dw)
+            if onlyRecent
+                for j = array.size(recent) - 1 to 0
+                    Drawn rd = array.get(recent, j)
+                    if not rd.alive
+                        array.remove(recent, j)
+                int excess = array.size(recent) - recentN
+                if excess > 0
+                    for j = 1 to excess
+                        clearDrawn(array.shift(recent))
+            else if array.size(recent) > 100
+                array.shift(recent)
+
+            lastName := pat.name
+            lastEnd  := pat.ex
+            wp := pat
+            watchOn := true
+            watchStart := bar_index
+            newBull := pat.bias == 1
+            newBear := pat.bias == -1
+
+// ─────────────── TARGET TRACKING (green = awaiting, red = reached) ───────────────
+if array.size(tracked) > 0
+    for i = array.size(tracked) - 1 to 0
+        Drawn dd = array.get(tracked, i)
+        if not dd.alive
+            array.remove(tracked, i)
+        else
+            bool done = false
+            for t in dd.tgs
+                if (t.dir == 1 and high >= t.price) or (t.dir == -1 and low <= t.price)
+                    done := true
+                    line.set_color(t.vl, cReach)
+                    line.set_color(t.cl, cReach)
+                    label.set_color(t.lb, cReach)
+            if done
+                tgtHit := true
+                array.remove(tracked, i)
+                if visMode != "All"
+                    clearDrawn(dd)
+
+// ─────────────── BREAKOUT WATCH (alerts) ───────────────
+bool  brkUp  = false
+bool  brkDn  = false
+
+if watchOn
+    if bar_index - watchStart > watchBars
+        watchOn := false
+    else if bar_index > watchStart
+        bool okVol = not needVol or volume > volMA
+        if not na(wp.uy1)
+            float uv  = lineAt(wp.ux1, wp.uy1, wp.ux2, wp.uy2, bar_index)
+            float uvp = lineAt(wp.ux1, wp.uy1, wp.ux2, wp.uy2, bar_index - 1)
+            if close > uv and close[1] <= uvp and okVol
+                brkUp := true
+        if not na(wp.ly1) and not brkUp
+            float lv  = lineAt(wp.lx1, wp.ly1, wp.lx2, wp.ly2, bar_index)
+            float lvp = lineAt(wp.lx1, wp.ly1, wp.lx2, wp.ly2, bar_index - 1)
+            if close < lv and close[1] >= lvp and okVol
+                brkDn := true
+        if brkUp or brkDn
+            watchOn := false
+
+if brkUp or brkDn
+    color bc = brkUp ? cBull : cBear
+    label.new(bar_index, brkUp ? low : high, (brkUp ? "▲ " : "▼ ") + wp.name + " breakout", xloc=xloc.bar_index, yloc=yloc.price, color=bc, style=brkUp ? label.style_label_up : label.style_label_down, textcolor=color.white, size=size.small)
+
+// ─────────────── ALERTS ───────────────
+alertcondition(brkUp,   "Pattern breakout UP",   "{{ticker}}: pattern breakout UP")
+alertcondition(brkDn,   "Pattern breakout DOWN", "{{ticker}}: pattern breakout DOWN")
+alertcondition(newBull, "New bullish pattern",   "{{ticker}}: new bullish pattern formed")
+alertcondition(newBear, "New bearish pattern",   "{{ticker}}: new bearish pattern formed")
+alertcondition(tgtHit,  "Pattern target reached", "{{ticker}}: pattern target reached")
